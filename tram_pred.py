@@ -192,7 +192,7 @@ def main():
 	source_path = sys.argv[1]
 	target_path = sys.argv[2]
 	cache_model_path = "final_model.pickle"
-	if os.path.isfile(cache_model_path):
+	if not os.path.isfile(cache_model_path):
 		print("Creating mute model ...")
 		mute_model = create_mute_model(source_path)
 		print("Creating tram model ...")
