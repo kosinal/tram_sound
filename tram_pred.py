@@ -10,6 +10,7 @@ from xgboost import XGBClassifier
 from timeblock import TimeBlock
 from stackedmodel import StackedModel, make_multiple_categories
 from pickle import Pickler, Unpickler
+from python_speech_features import mfcc, logfbank
 
 tram_types = ["1_New", "2_CKD_Long", "3_CKD_Short", "4_Old"]
 acc_types = ["accelerating", "braking"]
@@ -94,10 +95,13 @@ def split_into_blocks(data, fs, time_window=3):
 
 def create_sound_features(data, fs):
 	bins = 10
-	freq, times, spaces = log_specgram(data, fs)
+	emphasized_data = np.append(data[0], data[1:] - 0.95 * data[:-1])
 	result_feature = deque()
-	result_feature.extend(spaces.mean(axis=0))
-	for space_bin in np.array_split(spaces, bins):
+	mfcc_feat = mfcc(emphasized_data, fs, nfft=551)
+	for space_bin in np.array_split(mfcc_feat, bins):
+		result_feature.extend(space_bin.mean(axis=0))
+	log_feat = logfbank(emphasized_data, fs, nfft=551)
+	for space_bin in np.array_split(log_feat, bins):
 		result_feature.extend(space_bin.mean(axis=0))
 	return np.array(result_feature)
 
