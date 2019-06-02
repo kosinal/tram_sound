@@ -1,20 +1,45 @@
-
 import os
 import sys
 from collections import deque
+from pickle import Pickler, Unpickler
+
 import math
 import numpy as np
-from scipy import signal
+from python_speech_features import mfcc, logfbank
 from scipy.io import wavfile
 from xgboost import XGBClassifier
+
 from timeblock import TimeBlock
-from stackedmodel import StackedModel, make_multiple_categories
-from pickle import Pickler, Unpickler
-from python_speech_features import mfcc, logfbank
 
 tram_types = ["1_New", "2_CKD_Long", "3_CKD_Short", "4_Old"]
 acc_types = ["accelerating", "braking"]
 all_types = acc_types + ["negative"]
+threshold = 0.7
+
+
+def array_contains(input_array, check_array):
+	return all([i in check_array for i in input_array])
+
+
+def convert_to_numpy(input_obj):
+	if isinstance(input_obj, np.ndarray):
+		return input_obj
+	else:
+		return np.array(input_obj)
+
+
+def make_single_number(y_type_input, y_acc_input):
+	array_contains(y_acc_input, [0, 1])
+	array_contains(y_type_input, [0, 1, 2, 3])
+
+	return convert_to_numpy(y_type_input) + (10 * convert_to_numpy(y_acc_input))
+
+
+def make_multiple_categories(y_compound):
+	y_compound = int(y_compound)
+	acc_idx = y_compound // 10
+	tram_type_idx = y_compound % 10
+	return acc_idx, tram_type_idx
 
 
 def create_test_blocks(input_file, window_len=3, time_step=0.2):
@@ -28,22 +53,27 @@ def create_test_blocks(input_file, window_len=3, time_step=0.2):
 	return np.array(test_blocks)
 
 
-def get_sound_blocks(input_file, mute_model, sound_model, delta=0.6, min_dur=1.5):
+def get_sound_blocks(input_file, classifier, delta=0.6, min_dur=1.5):
 	test_sound = create_test_blocks(input_file)
-	predict_sound = mute_model.predict(test_sound)
-	final_predictions = sound_model.predict(test_sound)
+	predict_sound = classifier.predict_proba(test_sound)
 	sound_time = deque()
 	last_block = None
-	for index, (quiet_ind, final_prediction) in enumerate(zip(predict_sound, final_predictions)):
-		if quiet_ind == 0:
+	for index, final_prediction in enumerate(predict_sound):
+		argmax_prob = np.argmax(final_prediction)
+		max_prob = final_prediction[argmax_prob]
+		if max_prob < threshold:
+			continue
+		predicted_class = int(classifier.classes_[argmax_prob])
+		if predicted_class != 0:
 			seconds = index * 0.2
+			predicted_class -= 1
 			if last_block is None or not last_block.is_within_block(seconds):
 				if last_block is not None:
 					sound_time.append(last_block)
-				last_block = TimeBlock(seconds, final_prediction, delta=delta)
+				last_block = TimeBlock(seconds, predicted_class, delta=delta)
 			else:
 				last_block.add_new_time(seconds)
-				last_block.add(final_prediction)
+				last_block.add(predicted_class)
 	sound_time.append(last_block)
 	return filter_blocks(sound_time, min_dur)
 
@@ -69,8 +99,8 @@ def create_output_line(time, decoded):
 	return f"{time:.1f},{joined_dec}"
 
 
-def create_predict_file(input_path, mute_model, tram_model):
-	sound_blocks = get_sound_blocks(input_path, mute_model, tram_model, delta=1, min_dur=1.5)
+def create_predict_file(input_path, classifier):
+	sound_blocks = get_sound_blocks(input_path, classifier)
 	dec_list = [decode_sound_block(block) for block in sound_blocks]
 	lines = [create_output_line(time, decoded) for time, _, decoded in dec_list]
 	nl = "\n"
@@ -120,39 +150,7 @@ def prepare_file(root, file, time_window=None):
 	return tmp_X_datas, tmp_y_types, tmp_y_accs
 
 
-def log_specgram(audio, sample_rate, window_size=20,
-                 step_size=10, eps=1e-10):
-	nperseg = int(round(window_size * sample_rate / 1e3))
-	noverlap = int(round(step_size * sample_rate / 1e3))
-	freqs, times, spec = signal.spectrogram(audio,
-	                                        fs=sample_rate,
-	                                        window='hann',
-	                                        nperseg=nperseg,
-	                                        noverlap=noverlap,
-	                                        detrend=False)
-	return freqs, times, np.log(spec.T.astype(np.float32) + eps)
-
-
-def create_model_features(source_path):
-	X = deque()
-	y_type = deque()
-	y_acc = deque()
-
-	for root, _, files in os.walk(source_path):
-		if any([t_type in root for t_type in tram_types]):
-			for file in files:
-				tmp_X, tmp_y_type, tmp_y_acc = prepare_file(root, file)
-				X.extend(tmp_X)
-				y_type.extend(tmp_y_type)
-				y_acc.extend(tmp_y_acc)
-
-	X = np.array(X)
-	y_type = np.array(y_type).astype(np.uint8)
-	y_acc = np.array(y_acc).astype(np.uint8)
-	return X, y_type, y_acc
-
-
-def create_mute_model_features(source_path):
+def create_one_model_features(source_path):
 	X_neg = deque()
 	y_neg = deque()
 	for root, _, files in os.walk(source_path):
@@ -161,33 +159,29 @@ def create_mute_model_features(source_path):
 				is_mute_file = not any([a_type in root for a_type in acc_types])
 				if is_mute_file:
 					tmp_X, _, _ = prepare_file(root, file, time_window=3)
+					compound_y = 0
 				else:
-					tmp_X, _, _ = prepare_file(root, file)
+					tmp_X, tmp_y_type, tmp_y_acc = prepare_file(root, file)
+					compound_y = make_single_number([tmp_y_type], [tmp_y_acc])[0] + 1
 				X_neg.extend(tmp_X)
-				y_neg.extend(np.ones(len(tmp_X), dtype=np.uint8) * int(is_mute_file))
+				y_neg.extend(np.ones(len(tmp_X), dtype=np.uint8) * compound_y)
 	return np.array(X_neg), np.array(y_neg)
 
 
-def create_mute_model(source_path):
-	X_neg, y_neg = create_mute_model_features(source_path)
-	neg_xgb = XGBClassifier(objective='binary:logistic', eval_metric="auc", gamma=0, learning_rate=0.3, max_depth=3,
-	                        min_child_weight=1, n_estimators=300, nthread=-1)
-	neg_xgb.fit(X_neg, y_neg)
+def create_model(source_path):
+	X, y = create_one_model_features(source_path)
+	neg_xgb = XGBClassifier(objective='multi:softmax', eval_metric="auc", gamma=0, learning_rate=0.3,
+	                        max_depth=3, min_child_weight=1, n_estimators=300, nthread=-1,
+	                        num_class=len(np.unique(y)))
+	neg_xgb.fit(X, y)
 	return neg_xgb
 
 
-def create_tram_model(source_path):
-	X, y_type, y_acc = create_model_features(source_path)
-	model = StackedModel(y_acc, y_type)
-	model.fit(X, y_acc, y_type)
-	return model
-
-
-def create_output_csv(target_path, mute_model, tram_model):
+def create_output_csv(target_path, classifier):
 	for root, _, files in os.walk(target_path):
 		for file in files:
 			if file.endswith(".wav"):
-				create_predict_file(os.path.join(root, file), mute_model, tram_model)
+				create_predict_file(os.path.join(root, file), classifier)
 
 
 def main():
@@ -197,18 +191,16 @@ def main():
 	target_path = sys.argv[2]
 	cache_model_path = "final_model.pickle"
 	if not os.path.isfile(cache_model_path):
-		print("Creating mute model ...")
-		mute_model = create_mute_model(source_path)
-		print("Creating tram model ...")
-		tram_model = create_tram_model(source_path)
+		print("Creating model ...")
+		tram_model = create_model(source_path)
 		with open(cache_model_path, "wb") as f:
-			Pickler(f).dump((mute_model, tram_model))
+			Pickler(f).dump(tram_model)
 	else:
 		print("Using cached model ...")
 		with open(cache_model_path, "rb") as f:
-			mute_model, tram_model = Unpickler(f).load()
+			tram_model = Unpickler(f).load()
 	print("Predicting files")
-	create_output_csv(target_path, mute_model, tram_model)
+	create_output_csv(target_path, tram_model)
 
 
 if __name__ == "__main__":
